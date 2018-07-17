@@ -183,6 +183,29 @@ func TestAccAWSEFSFileSystem_kmsConfigurationWithoutEncryption(t *testing.T) {
 	})
 }
 
+func TestAccAWSEFSFileSystem_provisionedThroughput(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckEfsFileSystemDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccAWSEFSFileSystemConfigWithProvisionedThroughput(),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("aws_efs_file_system.foo", "provisioned_throughput_in_mibps", "1"),
+				),
+			},
+
+			{
+				Config: testAccAWSEFSFileSystemConfigWithProvisionedThroughputDisabled(),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckEfsThroughputMode("aws_efs_file_system.foo", efs.ThroughputModeBursting),
+				),
+			},
+		},
+	})
+}
+
 func testAccCheckEfsFileSystemDestroy(s *terraform.State) error {
 	conn := testAccProvider.Meta().(*AWSClient).efsconn
 	for _, rs := range s.RootModule().Resources {
@@ -321,6 +344,34 @@ func testAccCheckEfsFileSystemPerformanceMode(resourceID string, expectedMode st
 	}
 }
 
+func testAccCheckEfsThroughputMode(resourceID string, expectedMode string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[resourceID]
+		if !ok {
+			return fmt.Errorf("Not found: %s", resourceID)
+		}
+
+		if rs.Primary.ID == "" {
+			return fmt.Errorf("No ID is set: %s", resourceID)
+		}
+
+		conn := testAccProvider.Meta().(*AWSClient).efsconn
+		resp, err := conn.DescribeFileSystems(&efs.DescribeFileSystemsInput{
+			FileSystemId: aws.String(rs.Primary.ID),
+		})
+		if err != nil {
+			return err
+		}
+
+		fs := resp.FileSystems[0]
+		if *fs.ThroughputMode != expectedMode {
+			return fmt.Errorf("ThroughputMode mismatch. Expected \"%s\" but got \"%s\"", expectedMode, *fs.ThroughputMode)
+		}
+
+		return nil
+	}
+}
+
 const testAccAWSEFSFileSystemConfig = `
 resource "aws_efs_file_system" "foo" {
 	creation_token = "radeksimko"
@@ -389,4 +440,21 @@ resource "aws_efs_file_system" "foo-with-kms" {
   kms_key_id = "${aws_kms_key.foo.arn}"
 }
 `, rInt)
+}
+
+func testAccAWSEFSFileSystemConfigWithProvisionedThroughput() string {
+	return fmt.Sprintf(`
+resource "aws_efs_file_system" "foo" {
+  performance_mode = "generalPurpose"
+  provisioned_throughput_in_mibps = 1.0
+}
+`)
+}
+
+func testAccAWSEFSFileSystemConfigWithProvisionedThroughputDisabled() string {
+	return fmt.Sprintf(`
+resource "aws_efs_file_system" "foo" {
+  performance_mode = "generalPurpose"
+}
+`)
 }

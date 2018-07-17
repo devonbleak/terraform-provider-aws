@@ -73,6 +73,13 @@ func resourceAwsEfsFileSystem() *schema.Resource {
 				Computed: true,
 			},
 
+			"provisioned_throughput_in_mibps": {
+				Type:         schema.TypeFloat,
+				Optional:     true,
+				Default:      0.0,
+				ValidateFunc: validateProvisionedThroughputInMibps,
+			},
+
 			"tags": tagsSchema(),
 		},
 	}
@@ -99,6 +106,15 @@ func resourceAwsEfsFileSystemCreate(d *schema.ResourceData, meta interface{}) er
 
 	if v, ok := d.GetOk("performance_mode"); ok {
 		createOpts.PerformanceMode = aws.String(v.(string))
+	}
+
+	if v, ok := d.GetOk("provisioned_throughput_in_mibps"); ok {
+		if v.(float64) != 0.0 {
+			createOpts.SetProvisionedThroughputInMibps(v.(float64))
+			createOpts.SetThroughputMode(efs.ThroughputModeProvisioned)
+		} else {
+			createOpts.SetThroughputMode(efs.ThroughputModeBursting)
+		}
 	}
 
 	encrypted, hasEncrypted := d.GetOk("encrypted")
@@ -161,6 +177,63 @@ func resourceAwsEfsFileSystemCreate(d *schema.ResourceData, meta interface{}) er
 
 func resourceAwsEfsFileSystemUpdate(d *schema.ResourceData, meta interface{}) error {
 	conn := meta.(*AWSClient).efsconn
+
+	if d.HasChange("provisioned_throughput_in_mibps") {
+		_, n := d.GetChange("provisioned_throughput_in_mibps")
+
+		ufsi := &efs.UpdateFileSystemInput{
+			FileSystemId: aws.String(d.Id()),
+		}
+
+		if n.(float64) != 0.0 {
+			ufsi.SetProvisionedThroughputInMibps(n.(float64))
+			ufsi.SetThroughputMode(efs.ThroughputModeProvisioned)
+		} else {
+			ufsi.SetThroughputMode(efs.ThroughputModeBursting)
+		}
+
+		_, err := conn.UpdateFileSystem(ufsi)
+		if err != nil {
+			switch {
+			// ignore 400 errors about values that haven't changed
+			case isAWSErr(err, efs.ErrCodeBadRequest, "The requested throughput mode or provisioned throughput value are the same as the current mode and value."):
+			default:
+				return fmt.Errorf("Error updating EFS filesystem (%q): %+v", d.Id(), err)
+			}
+		}
+
+		// wait for change to complete
+		stateConf := &resource.StateChangeConf{
+			Pending: []string{"updating"},
+			Target:  []string{"available"},
+			Refresh: func() (interface{}, string, error) {
+				resp, err := conn.DescribeFileSystems(&efs.DescribeFileSystemsInput{
+					FileSystemId: aws.String(d.Id()),
+				})
+				if err != nil {
+					return nil, "error", err
+				}
+
+				if hasEmptyFileSystems(resp) {
+					return nil, "not-found", fmt.Errorf("EFS file system %q could not be found", d.Id())
+				}
+
+				fs := resp.FileSystems[0]
+				log.Printf("[DEBUG] current status of %q: %q", *fs.FileSystemId, *fs.LifeCycleState)
+				return fs, *fs.LifeCycleState, nil
+			},
+			Timeout:    10 * time.Minute,
+			Delay:      2 * time.Second,
+			MinTimeout: 3 * time.Second,
+		}
+
+		_, err = stateConf.WaitForState()
+		if err != nil {
+			return fmt.Errorf("Error waiting for EFS file system (%q) to update: %s",
+				d.Id(), err.Error())
+		}
+	}
+
 	err := setTagsEFS(conn, d)
 	if err != nil {
 		return fmt.Errorf("Error setting EC2 tags for EFS file system (%q): %s",
@@ -238,6 +311,7 @@ func resourceAwsEfsFileSystemRead(d *schema.ResourceData, meta interface{}) erro
 	d.Set("performance_mode", fs.PerformanceMode)
 	d.Set("encrypted", fs.Encrypted)
 	d.Set("kms_key_id", fs.KmsKeyId)
+	d.Set("provisioned_throughput_in_mibps", fs.ProvisionedThroughputInMibps)
 
 	region := meta.(*AWSClient).region
 	err = d.Set("dns_name", resourceAwsEfsDnsName(*fs.FileSystemId, region))
@@ -313,4 +387,13 @@ func hasEmptyFileSystems(fs *efs.DescribeFileSystemsOutput) bool {
 
 func resourceAwsEfsDnsName(fileSystemId, region string) string {
 	return fmt.Sprintf("%s.efs.%s.amazonaws.com", fileSystemId, region)
+}
+
+func validateProvisionedThroughputInMibps(v interface{}, k string) (ws []string, errors []error) {
+	value := v.(float64)
+	if value < 0.0 {
+		errors = append(errors, fmt.Errorf(
+			"%q cannot be negative: %f", k, value))
+	}
+	return
 }
